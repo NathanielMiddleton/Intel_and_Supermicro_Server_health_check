@@ -9,6 +9,8 @@
 #   -q  only print what is not OK (silent when healthy)
 # Env:  IPMITOOL_OPTS  extra ipmitool args; default is the local KCS interface (modprobe ipmi_si ipmi_devintf)
 #       TOOL_TIMEOUT   seconds per external command, default 60
+#       SEL_CLEAR_AT   archive the SEL to SEL_ARCHIVE and clear it once it is this % full (default 90, 0 = never)
+#       SEL_ARCHIVE    directory for the archived logs, default /var/log/ipmi-sel
 # Exit: 0 OK, 1 Warning, 2 Critical, 3 cannot check (BMC unreachable, or smartctl/storcli/nvidia-smi is
 #       needed for installed hardware but missing)
 # Every health line ends in ": OK", ": Warning", ": Critical" or ": ERROR"; summary and verdict are read from that.
@@ -16,6 +18,7 @@ set -u
 export LC_ALL=C
 
 q=0
+: "${SEL_CLEAR_AT:=90}" "${SEL_ARCHIVE:=/var/log/ipmi-sel}"; [[ $SEL_CLEAR_AT =~ ^[0-9]+$ ]] || SEL_CLEAR_AT=90
 while getopts ":q" o; do case $o in q) q=1;; *) echo "usage: $0 [-q]" >&2; exit 3;; esac; done
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -243,12 +246,23 @@ gpus() {
 }
 
 sel() {
-  local i e p
+  local i e p f n last
   echo "SEL:"
   i=$(ipmi sel info); e=$(kv Entries "$i"); p=$(kv 'Percent Used' "$i"); p=${p%\%}; num "$p" || p=
-  if num "$p" && (( p >= 90 )); then echo "  ${e:-?} entries, $p% used, nearly full (ipmitool sel clear): Warning"
-  else echo "  ${e:-?} entries${p:+, $p% used}: OK"; fi
-  ipmi sel elist last 5 | sed 's/ *| */ | /g; s/^ */  /'
+  if num "$p" && (( SEL_CLEAR_AT && p >= SEL_CLEAR_AT )); then
+    # IPMI has no truncate, only clear, and a full SEL stops recording. Archive every entry first, verify the
+    # dump is complete (a KCS timeout must never cost us the log), then clear so the BMC can log again.
+    mkdir -p "$SEL_ARCHIVE" 2>/dev/null; f="$SEL_ARCHIVE/sel-$(hostname -s)-$(date +%Y%m%d-%H%M%S).log"
+    { echo "$i"; echo; TOOL_TIMEOUT=900 ipmi sel elist; } > "$f" 2>/dev/null; n=$(grep -c '|' "$f" 2>/dev/null)
+    if (( n > 0 )) && { ! num "$e" || (( n >= e )); } && ipmi sel clear >/dev/null; then
+      logger -t smc_ipmi_health "SEL ${e:-?} entries, $p% full: archived $n entries to $f and cleared" 2>/dev/null
+      echo "  ${e:-?} entries, $p% used: archived to $f and cleared: OK"; last=$(grep '|' "$f" | tail -5)
+    else
+      echo "  ${e:-?} entries, $p% used, nearly full; archive to $SEL_ARCHIVE incomplete ($n of ${e:-?}), not cleared: Warning"; last=$(ipmi sel elist last 5)
+    fi
+  elif num "$p" && (( p >= 90 )); then echo "  ${e:-?} entries, $p% used, nearly full (ipmitool sel clear, or set SEL_CLEAR_AT): Warning"; last=$(ipmi sel elist last 5)
+  else echo "  ${e:-?} entries${p:+, $p% used}: OK"; last=$(ipmi sel elist last 5); fi
+  grep '|' <<<"$last" | sed 's/ *| */ | /g; s/^ */  /'
 }
 
 report() {
