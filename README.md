@@ -50,6 +50,25 @@ With a section selection the summary, `RESULT` line and exit code cover only wha
 Sections that don't need the BMC (`--network`, `--gpu`) run even on a machine without `ipmitool` or
 `/dev/ipmi0`. Aliases are accepted (`--disks`, `--raid`, `--psu`, `--mem`, `--nics`, `--temp`, …).
 
+### Silencing a section
+
+To stop a section from alerting without editing cron or the script, put its name in `/tmp/healthcheck`
+(or wherever `SILENCE_FILE` points), one per line or space separated, `#` comments allowed; the same names
+and aliases as the section flags work, and `all` silences everything:
+
+```
+echo storage > /tmp/healthcheck            # known bad disk, replacement on order
+echo "memory  # ticket 4711" >> /tmp/healthcheck
+```
+
+A directory works too (`mkdir /tmp/healthcheck; touch /tmp/healthcheck/storage`). A silenced section still
+runs and still prints, but its `Warning`/`Critical`/`ERROR` lines are tagged `[silenced]` and no longer
+count toward the summary, the `-q` output or the exit code; the summary shows `storage OK (silenced)` and a
+`Silenced via /tmp/healthcheck: storage` line makes the state visible on every run. Unknown names are
+reported and ignored. Because the file lives in `/tmp` it disappears at the next reboot — silences are
+meant to be temporary. Silencing is per *section*: silencing `fans` hides `FAN3 0 RPM` but not the
+chassis-level `Cooling/Fan Fault` flag, which lives under `chassis`.
+
 Environment:
 
 | Variable | Default | Meaning |
@@ -58,6 +77,7 @@ Environment:
 | `TOOL_TIMEOUT` | `60` | seconds allowed per external command (`ipmitool`, `smartctl`, `storcli`, `nvidia-smi`, …) |
 | `SEL_CLEAR_AT` | `90` | fill level at which `--clearsel` acts; `0` clears whenever the flag is given |
 | `SEL_ARCHIVE` | `/var/log/ipmi-sel` | where the archived logs go, one `sel-<host>-<timestamp>.log` per clear |
+| `SILENCE_FILE` | `/tmp/healthcheck` | sections to silence, see below |
 
 Exit codes follow the Nagios convention: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (not root, BMC
 unreachable, or a needed tool is missing and nothing worse was found).
@@ -103,7 +123,9 @@ As a Nagios/Icinga/check_mk local check, run it without `-q` and let the plugin 
 **Supermicro.** Sensor names follow the usual scheme (`CPU1 Temp`, `P1-DIMMA1 Temp`, `FAN1`…`FANB`,
 `PS1 Status`). A failed PSU keeps status `ok` in the SDR and only changes its reading text, which is why
 discrete sensors are judged by the `BAD`/`WARN` keyword lists near the top of the script. Empty fan headers
-and DIMM slots show as `ns` and are treated as absent. The `Chassis Intru` sensor latches the first time the
+and DIMM slots show as `ns` and are treated as absent. The backplane exposes one `HDD n Status` sensor per
+bay; an empty bay has no asserted state and is counted (`4 empty drive bays`) rather than listed as a drive,
+and an empty PSU slot is reported as `no PSU detected in this slot`. The `Chassis Intru` sensor latches the first time the
 lid comes off and stays asserted until cleared in the BMC, so it is reported without a verdict.
 
 **Intel.** The Intel BMC reports CPU and DIMM temperatures as *thermal margins* (`P1 Therm Margin`,
