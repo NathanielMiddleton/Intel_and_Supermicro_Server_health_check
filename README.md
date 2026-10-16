@@ -1,135 +1,120 @@
 # smc_ipmi_health.sh
 
-Hardware health check for Supermicro servers, run from inside the OS. It is the in-band counterpart of
-`hpe_ilorest_health.sh`: same flags, same exit codes, same "grep the report for the verdict" design, but it
-talks to the BMC with `ipmitool` instead of Redfish and adds disk, RAID and GPU checks from local tools.
+Hardware health check for Supermicro and Intel servers, run from inside the OS.
 
-bash + coreutils/grep/sed/awk only. No jq, no Python, no vendor agents.
+Any board with a standard IPMI BMC gets most of it; the vendor-specific sensor names and quirks of
+Supermicro (X9–X13, H11–H13) and Intel (S2600 family, M50CYP, D50TNP) are handled explicitly.
 
 ## What it checks
 
-| Section | Source | What is flagged |
+| Section | Source | Flagged |
 |---|---|---|
-| System | `dmidecode`, `ipmitool fru/chassis/mc` | chassis fault flags (power, fan, drive), intrusion, BMC self-test |
-| Processors | `dmidecode -t processor` + `CPUn Temp` sensor | socket not `Populated, Enabled` |
-| Memory | `dmidecode -t 17`, EDAC sysfs | per-controller and per-DIMM CE/UE counters (inventory lines carry no verdict) |
-| Temperatures, Fans, Voltages, Other | `ipmitool sdr elist` (one call) | status `nc` → WARNING, `cr`/`nr` → CRITICAL; discrete readings matched against keyword lists |
-| Power | `PSn Status` sensors, `ipmitool dcmi power reading`, `ipmicfg -pminfo` | PSU failure / AC lost, PMBus status not OK, fewer PSUs than `MIN_PSUS` |
-| Storage | `/proc/mdstat`, `zpool`, `storcli64`/`perccli64`, `smartctl --scan-open` | degraded/rebuilding arrays, VD/PD states, media and predictive-failure counts, SMART health, NVMe wear/spare/critical warning, ATA reallocated/pending/offline sectors and SSD life, SAS grown defects and uncorrected errors |
-| GPUs | `lspci`, `nvidia-smi`, kernel log | GPUs missing from the driver, volatile ECC UE/CE, row-remap failure/pending, retired pages, PCIe width degradation, hw/thermal/power-brake slowdown, temperature, reset required, fabric state, infoROM corruption, NVLink error counters, Xids per bus id |
-| SEL | `ipmitool sel elist last N`, `sel info`, `sel time get` | asserted events in the look-back window matched against keyword lists, log ≥ 90 % full or overflowed, BMC clock off by more than a day |
-| Kernel log | `journalctl -k` (fallback `dmesg -T`) | MCE/EDAC hardware errors, disk I/O errors, PCIe AER errors |
+| System | sysfs DMI, `ipmitool mc info`, `lan print` | model, serials, BIOS, BMC vendor/firmware/IP (channels 1, 8, 3, 2 are tried) |
+| Chassis | `ipmitool chassis status`, misc discrete sensors | power/fan/drive fault flags (Critical). Intrusion, redundancy, watchdog and other misc sensors are shown but only Critical-class readings are scored; a latched intrusion sensor is listed, not judged. Healthy misc sensors collapse into one count line |
+| Processors | `dmidecode -t processor`, dmesg, CPU discrete sensors | socket not `Populated, Enabled`, machine-check lines, `IERR`/`Thermal Trip`/`Configuration Error`/throttling |
+| Memory | `dmidecode -t memory`, EDAC sysfs, memory discrete sensors | per-controller and per-DIMM CE/UE counters, memory thermal-trip sensors |
+| Temperatures, Fans, Voltages | `ipmitool sdr elist` (one call) | status `nc`/`lnc`/`unc` → Warning, `cr`/`nr`/… → Critical; thresholds are fetched only for sensors that are not OK |
+| Power | `ipmitool dcmi power reading` (or the sum of `PSn Power In`), PSU sensors | AC lost, failure, predictive failure, PSU redundancy |
+| Storage | `storcli64`/`perccli64`, `mdadm --detail`, `zpool`, `smartctl --scan-open`, drive-slot sensors | controller status and cache memory errors, VD/PD states, md degraded/recovering, zpool health, SMART health, NVMe critical warning/spare/media errors, ATA reallocated/pending/uncorrectable sectors (named individually), SAS grown defects, SSD wear |
+| Network | sysfs, `ip addr` | physical NICs that are up with no carrier **and** either carry an address or belong to a bond/bridge; unplugged spare ports are listed without a verdict |
+| GPUs | `lspci`, `nvidia-smi`, dmesg, amdgpu sysfs | GPUs missing from the driver, volatile ECC UE, retired pages / row remap pending or failed, hw/thermal slowdown, PCIe width degradation, NVLink error counters, Xids per GPU (48 63 64 74 79 92 94 95 119 120 are Critical); AMD RAS UE/CE counters |
+| SEL | `ipmitool sel info`, `sel elist last 5` | log ≥ 90 % full; the last five events are printed for context, not judged |
 
-Each tool is optional except `ipmitool`; a missing tool just drops that part of the report (and says so).
+Each tool is optional except `ipmitool`. A missing tool is reported as `ERROR` only when the hardware it
+covers is present (a MegaRAID card without `storcli`, NVIDIA GPUs without `nvidia-smi`, no `smartctl` at all).
 
 ## Requirements
 
-- Root: `/dev/ipmi0`, `dmidecode`, `smartctl` and the kernel journal all need it.
-- `ipmitool` and the `ipmi_si`/`ipmi_devintf` kernel modules (the script tries `modprobe` itself).
-- Optional: `dmidecode`, `smartmontools`, `pciutils`, `storcli64` or `perccli64`, Supermicro `ipmicfg`,
-  `zfsutils`, the NVIDIA driver (`nvidia-smi`).
-- bash 4.x or newer, GNU `date`, `timeout`, `awk`.
+- Root (the script refuses to run otherwise): `/dev/ipmi0`, `dmidecode`, `smartctl` and `dmesg` need it.
+- `ipmitool` with `ipmi_si` + `ipmi_devintf` loaded (`ipmi_ssif` on a few boards).
+- Optional: `dmidecode`, `smartmontools`, `pciutils`, `mdadm`, `zfsutils`, `storcli64`/`perccli64`
+  (also found under `/opt/MegaRAID`), the NVIDIA driver (`nvidia-smi`), `amdgpu`.
+- bash 4+, GNU awk/sed/grep, `timeout`.
 
 ## Usage
 
 ```
-smc_ipmi_health.sh [-q] [-d DAYS] [-n N]
+smc_ipmi_health.sh [-q]
 
-  -q        only print what is not OK; prints nothing at all when healthy
-  -d DAYS   look-back window for the SEL and the kernel log (default 7)
-  -n N      scan only the newest N SEL entries (default 500; 0 = whole SEL, slow over KCS)
+  -q   only print what is not OK; prints nothing at all when healthy
 ```
 
-Environment variables:
+Environment:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `IPMITOOL_OPTS` | empty | extra `ipmitool` arguments, e.g. `-I open`, or `-H bmc -U admin -f pwfile` to query the BMC out of band |
-| `DIMM_CE_WARN` | `1` | WARNING when EDAC corrected errors reach this count (0 disables) |
-| `GPU_CE_WARN` | `100` | WARNING when a GPU's volatile corrected ECC count reaches this (0 disables) |
-| `GPU_TEMP_WARN` | `90` | WARNING at or above this GPU core temperature in °C (0 disables) |
-| `MIN_FANS` | `0` | WARNING when fewer fans report a reading (0 disables) |
-| `MIN_PSUS` | `0` | WARNING when fewer PSUs report `Presence detected` (0 disables) |
+| `TOOL_TIMEOUT` | `60` | seconds allowed per external command (`ipmitool`, `smartctl`, `storcli`, `nvidia-smi`, …) |
 
-Exit codes follow the Nagios convention: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (BMC unreachable,
-or a check could not run and nothing worse was found).
+Exit codes follow the Nagios convention: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (not root, BMC
+unreachable, or a needed tool is missing and nothing worse was found).
 
 ## Output
 
-Every item line ends in `: OK`, `: WARNING`, `: CRITICAL` or `: ERROR`, with the reasons in brackets just
-before the verdict. The `Summary:` line gives the worst verdict per section (`n/a` means nothing in that
-section produced a verdict, e.g. memory without EDAC loaded). The final `RESULT:` line and the exit code are
+Every judged line ends in `: OK`, `: Warning`, `: Critical` or `: ERROR`, with the reasons just before the
+verdict. The `Summary:` line gives the worst verdict per section. The `RESULT:` line and the exit code are
 derived from the same text, so what you see is exactly what was judged.
 
 ```
-Summary: system OK, processors OK, memory OK, temperatures OK, fans CRITICAL, power CRITICAL, voltages OK, ...
-System: Supermicro SYS-1029U-TN10RT SN S1234..., board X11DPU SN ZM18..., BIOS 3.4 11/19/2020
-  power on, chassis fault flags none: OK
-  intrusion inactive: OK
-  BMC Supermicro firmware 1.73, selftest passed: OK
-Fans: 7 reporting
+System: Supermicro SYS-1029U-TN10RT SN ..., board X11DPU SN ..., power on, BIOS 3.4 (11/19/2020), BMC Supermicro 1.73 at 10.0.0.12
+Summary: chassis OK, processors OK, memory OK, temperatures OK, fans Critical, power Critical, storage Warning, network OK, gpus OK, sel OK
+Chassis:
+  Cooling/Fan Fault false: OK
+  Chassis Intrusion inactive: OK
+  3 other discrete sensors: OK
+Fans:
   FAN1 6300 RPM: OK
-  FAN3 0 RPM: CRITICAL
-Power: 312 Watts in use, 2 PSU present
-  PS2 Status Presence detected, Failure detected, Power Supply AC lost: CRITICAL
+  FAN3 0 RPM (thresholds lnr 300 lcr 500 lnc 700): Critical
+Power: 312 Watts in use
+  PS2 Status Presence detected, Failure detected, Power Supply AC lost: Critical
 Storage:
-  raid c0 vd 1/1 RAID5 7.276 TB data Dgrd [Dgrd]: CRITICAL
-  /dev/nvme0 SAMSUNG MZQL23T8HCLS SN S64H... 36C: PASSED, life 97%, spare 100%, media errors 0, critical warning 0x00: OK
-GPUs: 3 NVIDIA, 0 AMD on the PCI bus
-  driver 535.129.03, 2 of 3 GPUs answer nvidia-smi [1 GPU(s) not visible to the driver (fallen off the bus?)]: CRITICAL
-  GPU1 NVIDIA A100-PCIE-40GB SN ... D8:00.0: 52C/48C hbm, 61/250W, ..., pcie gen1/4 x8/x16 [pcie x8 of x16, xid 31(x2)]: WARNING
-  GPU at 0000:af:00: not visible to the driver, xid 79(x1): CRITICAL
+  AVAGO MegaRAID SAS 9361-8i SN ... fw 4.680.00-8424, status Needs Attention, memory errors 0/0: Warning
+    volume 1/1 RAID5 7.276 TB data Dgrd: Warning
+    drive /dev/nvme0 SAMSUNG MZQL23T8HCLS-00A07 S64H..., 3% used: OK
 RESULT: CRITICAL
 ```
 
 With `-q` the output is just `hostname VERDICT` followed by the offending lines, which makes it cron-mail friendly:
 
 ```
-# every hour, mail only when something is wrong
 0 * * * * root /usr/local/sbin/smc_ipmi_health.sh -q
 ```
 
 As a Nagios/Icinga/check_mk local check, run it without `-q` and let the plugin framework keep the long output.
 
-## How the verdicts are decided
+## Vendor notes
 
-- **Sensors**: the `sdr elist` status column decides for threshold sensors (`nc` warning, `cr`/`nr` critical).
-  Discrete sensors (PSU status, drive slots, intrusion) keep status `ok` even when they report a fault, so
-  their reading text is matched against `S_CRIT` and `S_WARN` at the top of the script. Sensors with status
-  `ns` (no reading) are dropped: that is how Supermicro reports empty fan headers and DIMM slots.
-- **SEL**: only `Asserted` events inside the window count (a `Deasserted` means it recovered). Events are
-  classified by `SEL_CRIT`/`SEL_WARN`; anything else is informational and only counted. `Pre-Init` entries
-  (logged before the BMC had a clock) are skipped. The first 20 flagged events are printed.
-- **GPUs**: hardware-class Xids (`XID_CRIT`: 48, 64, 74, 79, 94, 95, 119, 120, 140) are CRITICAL, any other Xid
-  is WARNING. Volatile (since boot) ECC counters are judged; lifetime aggregates are shown but not judged.
-  Fields the installed driver does not support are shown as `-` and skipped.
-- **Disks**: SMART overall health FAILED is CRITICAL. Reallocated/pending/offline-uncorrectable sectors,
-  grown defects, media errors, ≤ 10 % SSD life or NVMe `Percentage Used` ≥ 90 % are WARNING. NVMe
-  `Critical Warning != 0x00` or spare below threshold is CRITICAL.
-- **Precedence** everywhere: CRITICAL > WARNING > ERROR > OK.
+**Supermicro.** Sensor names follow the usual scheme (`CPU1 Temp`, `P1-DIMMA1 Temp`, `FAN1`…`FANB`,
+`PS1 Status`). A failed PSU keeps status `ok` in the SDR and only changes its reading text, which is why
+discrete sensors are judged by the `BAD`/`WARN` keyword lists near the top of the script. Empty fan headers
+and DIMM slots show as `ns` and are treated as absent. The `Chassis Intru` sensor latches the first time the
+lid comes off and stays asserted until cleared in the BMC, so it is reported without a verdict.
 
-All keyword lists and thresholds sit together at the top of the script; adjusting them is the expected first
-step after the first run on a new platform.
+**Intel.** The Intel BMC reports CPU and DIMM temperatures as *thermal margins* (`P1 Therm Margin`,
+`DIMM Thrm Mrgn 1`): negative numbers are headroom to Tcontrol and are labelled as such. `P1 Status`,
+`Mem P1 Thrm Trip`, `PS1 Power In`, `PS Redundancy`/`Fan Redundancy` and the many informational discrete
+sensors (watchdogs, buttons, presence) are routed to the right sections; `Non-Redundant`,
+`Configuration Error`, `In Critical Array` and friends are classified. Percent/CFM sensors
+(`P1 Therm Ctrl %`, `System Airflow`) are judged by their status column. If the BMC has no DCMI power
+reading, the `PSn Power In` sensors are summed instead. Intel VMD/VROC/RSTe RAID is md-based: the IMSM
+container (`md127`, always *inactive*) is listed without a verdict and the member arrays are judged normally.
 
 ## Known gaps and caveats
 
-- Written against stubbed tool output, not against a lab of Supermicro boxes. Expect a tuning pass on
-  real output, especially the SEL event wording, which varies between X9/X10/X11/X12/X13 firmware.
-- Sensor and locator naming is assumed to be the usual Supermicro scheme (`PS1 Status`, `Presence detected`,
-  `CPU1 Temp`, `P1-DIMMA1`). Boards that deviate still get checked, but a few cross-references (CPU temp on
-  the CPU line, PSU presence count) will come out empty.
-- A fan or PSU that was present and is now gone cannot be detected from the SDR alone; use `MIN_FANS` and
-  `MIN_PSUS` for that.
+- Written against stubbed tool output, not against a lab full of boards. Expect a short tuning pass on real
+  output, mostly to the `BAD`/`WARN` keyword lists.
+- A fan or PSU that was present and is now gone cannot be told apart from an empty header; the SDR simply
+  stops reporting it.
 - EDAC per-DIMM counters are reported with the EDAC label (`CPU_SrcID#0_MC#0_Chan#0_DIMM#0`), not the
-  `P1-DIMMA1` locator; mapping between the two is platform specific and is not attempted.
-- AMD GPUs are counted but not inspected. NVIDIA GPUs in MIG mode are fine. Checks that need a newer
-  driver (row remapping, `clocks_event_reasons`, fabric/reset status) degrade silently on old ones.
-- Broadcom HBAs in IR mode (`sas3ircu`), Intel VROC and Adaptec controllers are not parsed; disks behind them
-  still show up through `smartctl` if the driver exposes them.
-- Kernel-log pattern matching counts lines, not events; a chatty AER source can inflate the counts.
-  Corrected AER errors are shown but never raise the verdict.
-- Timings: `sdr elist` and `sel elist` go over the slow KCS interface and take a few seconds each; the whole
-  SEL (`-n 0`) on a full log can take a minute or more. `smartctl` is run once per disk.
+  DMI locator; mapping between the two is platform specific and not attempted.
+- The SEL is shown, not classified: the last five entries are printed for context and only the fill level
+  raises the verdict. Memory ECC events therefore surface through EDAC and dmesg, not the SEL.
+- Broadcom HBAs in IR mode (`sas3ircu`) and Adaptec controllers are not parsed; disks behind them still
+  appear through `smartctl` if the driver exposes them.
+- NVIDIA checks that need a newer driver (row remapping, `clocks_event_reasons`) degrade silently on old
+  ones; MIG mode is fine. AMD coverage is what `amdgpu` sysfs exposes (temperature, power, VRAM, RAS counters).
+- `ipmitool sdr elist` and `sel` go over the slow KCS interface and take a few seconds each; thresholds
+  are fetched only for sensors that are not OK, so a healthy box stays fast.
 
 ## Files
 
