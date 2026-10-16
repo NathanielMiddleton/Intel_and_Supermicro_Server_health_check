@@ -17,6 +17,11 @@
 #       TOOL_TIMEOUT   seconds per external command, default 60
 #       SEL_CLEAR_AT   fill level (%) at which --clearsel acts, default 90 (0 = always clear when --clearsel is given)
 #       SEL_ARCHIVE    directory for the archived logs, default /var/log/ipmi-sel
+#       SILENCE_FILE   default /tmp/healthcheck: section names to silence (same names as the --section flags, one
+#                      per line or space separated, # comments; a directory whose entry names are sections also
+#                      works; "all" silences everything). Silenced sections still run and print, but their
+#                      Warning/Critical/ERROR lines are tagged [silenced] and ignored by the summary, the -q
+#                      output and the exit code. Living in /tmp, the file disappears on reboot by design.
 # Exit: 0 OK, 1 Warning, 2 Critical, 3 cannot check (BMC unreachable, or smartctl/storcli/nvidia-smi is
 #       needed for installed hardware but missing)
 # Every health line ends in ": OK", ": Warning", ": Critical" or ": ERROR"; summary and verdict are read from that.
@@ -38,6 +43,13 @@ set -- ${args[@]+"${args[@]}"}
 : "${SEL_CLEAR_AT:=90}" "${SEL_ARCHIVE:=/var/log/ipmi-sel}"; [[ $SEL_CLEAR_AT =~ ^[0-9]+$ ]] || SEL_CLEAR_AT=90
 while getopts ":qch" o; do case $o in q) q=1;; c) clearsel=1;; h) usage; exit 0;; *) usage >&2; exit 3;; esac; done
 needbmc=0; for x in system chassis processors memory temperatures fans voltages power storage sel; do want $x && needbmc=1; done
+: "${SILENCE_FILE:=/tmp/healthcheck}"; silenced=; silbad=; words=
+if   [[ -d $SILENCE_FILE ]]; then words=$(ls -A "$SILENCE_FILE" 2>/dev/null)
+elif [[ -f $SILENCE_FILE ]]; then words=$(sed 's/#.*//' "$SILENCE_FILE" 2>/dev/null); fi
+for w in $words; do
+  if [[ ${w,,} == all ]]; then silenced=" system chassis processors memory temperatures fans voltages power storage network gpus sel"
+  else x=$(sect "${w,,}"); if [[ $x ]]; then silenced+=" $x"; else silbad+=" $w"; fi; fi
+done
 
 have() { command -v "$1" >/dev/null 2>&1; }
 run()  { timeout "${TOOL_TIMEOUT:-60}" "$@" 2>/dev/null </dev/null; }      # external tool, stderr dropped
@@ -61,6 +73,8 @@ thr()  { ipmi sensor get "$1" | awk -F': *' '/^ (Lower|Upper) (Non-Critical|Crit
 RE_MEM='DIMM|MEM|Mem'; RE_CPU='CPU|Proc|^P[0-9]+ '; RE_PSU='^PS[0-9]|Power Supply|PSU|PWR'     # Intel BMC: "P1 Status", "Mem P1 Thrm Trip"
 RE_DRV='HDD|Drive|SAS|NVMe|SSD|Disk|Slot|M2|M\.2|BPN|Backplane'
 # sensors t UNIT_RE: threshold sensors whose reading matches; sensors d|D NAME_RE: discrete sensors whose name matches|doesn't
+# Presence-style discrete sensors with an empty reading are not printed but appended to ABSENT (callers reset and report it)
+ABSENT=()
 sensors() {
   local n id s e r w t
   while IFS='|' read -r -u3 n id s e r; do
@@ -72,6 +86,7 @@ sensors() {
     else
       [[ $r =~ (degrees|RPM|Volts|Watts|Amps|^No Reading$) || $s == ns || $s == na ]] && continue
       if [[ $1 == d ]]; then [[ $n =~ $2 ]] || continue; else [[ $n =~ $2 ]] && continue; fi
+      [[ -z $r && $s == ok && $n =~ Status$ ]] && { ABSENT+=("$n"); continue; }   # "HDD 3 Status" with nothing asserted = empty bay, not a healthy drive
       w=$(dst "$r"); t=$(ipst "$s"); [[ $t == Critical || ( $t == Warning && $w == OK ) ]] && w=$t   # "P1 Therm Ctrl %", "System Airflow" carry status, not text
       echo "  $n${r:+ $r}: $w"
     fi
@@ -90,7 +105,7 @@ processors() {
   else echo "  dmidecode not installed, $(nproc) logical CPUs"; fi
   n=$(grep -cE 'mce: \[Hardware Error\]|Machine check events logged' <<<"$DMESG")
   echo "  machine check (MCE) lines in dmesg $n: $([[ $n == 0 ]] && echo OK || echo Warning)"
-  sensors d "$RE_CPU"
+  ABSENT=(); sensors d "$RE_CPU"                                       # empty "P2 Status" = unpopulated socket, dmidecode already said so
 }
 
 memory() {
@@ -115,7 +130,7 @@ memory() {
     done
   done
   (( n )) || echo "  edac not loaded, no OS-side ECC counters"
-  sensors d "$RE_MEM"
+  ABSENT=(); sensors d "$RE_MEM"
 }
 
 drive() {   # drive DEV TYPE: one smartctl line (SATA, SAS, NVMe, drives behind MegaRAID)
@@ -179,7 +194,8 @@ storage() {
   if have smartctl; then
     while read -r -u3 m _ s _; do [[ $m == /dev/* ]] && drive "$m" "$s"; done 3< <(run smartctl --scan-open)
   else echo "  smartctl not installed, drive SMART not checked: ERROR"; fi
-  sensors d "$RE_DRV"
+  ABSENT=(); sensors d "$RE_DRV"; (( ${#ABSENT[@]} )) && echo "  ${#ABSENT[@]} empty drive bays"
+  return 0
 }
 
 network() {   # physical NICs that are administratively up; no carrier only matters if the port is meant to carry traffic
@@ -310,7 +326,8 @@ power() {
   v=$(kv 'Instantaneous power reading' "$(ipmi dcmi power reading)")
   [[ $v ]] || v=$(awk -F'|' '$1 ~ /^PS[0-9]+ (Power In|Input Power)$/ && $5 ~ /Watts/ {w+=$5+0} END{if(w) print w" Watts (sum of PSU inputs)"}' <<<"$SDR")   # no DCMI: add up Intel "PSn Power In"
   echo "Power:${v:+ $v in use}"
-  sensors t 'Watts|Amps'; sensors d "$RE_PSU"
+  sensors t 'Watts|Amps'; ABSENT=(); sensors d "$RE_PSU"
+  for v in ${ABSENT[@]+"${ABSENT[@]}"}; do echo "  $v: no PSU detected in this slot"; done
 }
 
 report() {   # every section is its own function; a selection on the command line (--storage ...) picks which ones run
@@ -339,6 +356,10 @@ if (( needbmc )); then
 fi
 { want processors || want gpus; } && DMESG=$(run dmesg)
 out=$(report)
+[[ $silenced ]] && out=$(awk -v sil="$silenced " '/^[^ ]/{sec=tolower($1); sub(/:.*/,"",sec); z=index(sil," "sec" ")>0}
+                                              z && /: (Warning|Critical|ERROR)$/{sub(/: (Warning|Critical|ERROR)$/,"& [silenced]")} {print}' <<<"$out")
+silnote=; [[ $silenced ]] && silnote="Silenced via $SILENCE_FILE:$silenced${silbad:+ (unknown, ignored:$silbad)}"
+[[ $silbad && -z $silenced ]] && silnote="Silence file $SILENCE_FILE: unknown section name(s):$silbad (nothing silenced)"
 
 # verdict from the text: Critical > Warning > ERROR > OK
 if   grep -qE ': Critical$' <<<"$out"; then rc=2; v=CRITICAL
@@ -346,13 +367,15 @@ elif grep -qE ': Warning$'  <<<"$out"; then rc=1; v=WARNING
 elif grep -qE ': ERROR$'    <<<"$out"; then rc=3; v=UNKNOWN
 else rc=0; v=OK; fi
 
-if (( q )); then (( rc )) && { echo "$(hostname -s) $v"; grep -E ': (Critical|Warning|ERROR)$' <<<"$out"; }
+if (( q )); then (( rc )) && { echo "$(hostname -s) $v"; [[ $silnote ]] && echo "$silnote"; grep -E ': (Critical|Warning|ERROR)$' <<<"$out"; }
 else
   [[ $out == System:* ]] && { head -1 <<<"$out"; out=$(tail -n +2 <<<"$out"); }
-  awk '/^[^ ]/{sec=tolower($1); sub(/:.*/,"",sec); next}          # worst status per section
+  awk '/^[^ ]/{sec=tolower($1); sub(/:.*/,"",sec); next}          # worst status per section; silenced sections say so
        /: (OK|Warning|Critical|ERROR)$/{r=($NF=="Critical")?3:($NF=="Warning")?2:($NF=="ERROR")?1:0
          if(!(sec in w)){o[++n]=sec; w[sec]=0} if(r>w[sec]) w[sec]=r}
-       END{split("OK ERROR Warning Critical",t," "); printf "Summary:"; for(i=1;i<=n;i++) printf "%s %s %s",(i>1?",":""),o[i],t[w[o[i]]+1]; print ""}' <<<"$out"
+       /: (Warning|Critical|ERROR) \[silenced\]$/{if(!(sec in w)){o[++n]=sec; w[sec]=0} z[sec]=1}
+       END{split("OK ERROR Warning Critical",t," "); printf "Summary:"; for(i=1;i<=n;i++) printf "%s %s %s%s",(i>1?",":""),o[i],t[w[o[i]]+1],(o[i] in z?" (silenced)":""); print ""}' <<<"$out"
+  [[ $silnote ]] && echo "$silnote"
   [[ $out ]] && echo "$out"; echo "RESULT: $v"
 fi
 exit $rc
