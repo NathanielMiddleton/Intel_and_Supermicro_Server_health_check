@@ -18,7 +18,7 @@ Supermicro (X9–X13, H11–H13) and Intel (S2600 family, M50CYP, D50TNP) are ha
 | Storage | `storcli64`/`perccli64`, `mdadm --detail`, `zpool`, `smartctl --scan-open`, drive-slot sensors | controller status and cache memory errors, VD/PD states, md degraded/recovering, zpool health, SMART health, NVMe critical warning/spare/media errors, ATA reallocated/pending/uncorrectable sectors (named individually), SAS grown defects, SSD wear |
 | Network | sysfs, `ip addr` | physical NICs that are up with no carrier **and** either carry an address or belong to a bond/bridge; unplugged spare ports are listed without a verdict |
 | GPUs | `lspci`, `nvidia-smi`, dmesg, amdgpu sysfs | GPUs missing from the driver, volatile ECC UE, retired pages / row remap pending or failed, hw/thermal slowdown, PCIe width degradation, NVLink error counters, Xids per GPU (48 63 64 74 79 92 94 95 119 120 are Critical); AMD RAS UE/CE counters |
-| SEL | `ipmitool sel info`, `sel elist last 5` | log ≥ 90 % full; the last five events are printed for context, not judged |
+| SEL | `ipmitool sel info`, `sel elist` | when the log is ≥ `SEL_CLEAR_AT` % full (default 90) it is archived in full to `SEL_ARCHIVE` and then cleared, so the BMC keeps logging; the last five events are printed for context, not judged |
 
 Each tool is optional except `ipmitool`. A missing tool is reported as `ERROR` only when the hardware it
 covers is present (a MegaRAID card without `storcli`, NVIDIA GPUs without `nvidia-smi`, no `smartctl` at all).
@@ -45,6 +45,8 @@ Environment:
 |---|---|---|
 | `IPMITOOL_OPTS` | empty | extra `ipmitool` arguments, e.g. `-I open`, or `-H bmc -U admin -f pwfile` to query the BMC out of band |
 | `TOOL_TIMEOUT` | `60` | seconds allowed per external command (`ipmitool`, `smartctl`, `storcli`, `nvidia-smi`, …) |
+| `SEL_CLEAR_AT` | `90` | archive and clear the SEL once it is this % full; `0` never clears (a full SEL is then a Warning) |
+| `SEL_ARCHIVE` | `/var/log/ipmi-sel` | where the archived logs go, one `sel-<host>-<timestamp>.log` per clear |
 
 Exit codes follow the Nagios convention: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (not root, BMC
 unreachable, or a needed tool is missing and nothing worse was found).
@@ -107,8 +109,12 @@ container (`md127`, always *inactive*) is listed without a verdict and the membe
   stops reporting it.
 - EDAC per-DIMM counters are reported with the EDAC label (`CPU_SrcID#0_MC#0_Chan#0_DIMM#0`), not the
   DMI locator; mapping between the two is platform specific and not attempted.
-- The SEL is shown, not classified: the last five entries are printed for context and only the fill level
-  raises the verdict. Memory ECC events therefore surface through EDAC and dmesg, not the SEL.
+- The SEL is shown, not classified: the last five entries are printed for context. Memory ECC events
+  therefore surface through EDAC and dmesg, not the SEL.
+- IPMI has no partial truncate, only `sel clear`, and most BMCs (Supermicro's 512-entry SEL included) stop
+  recording once full. The script therefore archives the complete log before clearing, verifies the dump
+  holds as many entries as the BMC reports, refuses to clear otherwise, and notes each clear in syslog
+  (`logger -t smc_ipmi_health`). Set `SEL_CLEAR_AT=0` if the SEL must only be cleared by hand.
 - Broadcom HBAs in IR mode (`sas3ircu`) and Adaptec controllers are not parsed; disks behind them still
   appear through `smartctl` if the driver exposes them.
 - NVIDIA checks that need a newer driver (row remapping, `clocks_event_reasons`) degrade silently on old
