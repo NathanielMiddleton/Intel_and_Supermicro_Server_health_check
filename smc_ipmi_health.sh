@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# smc_ipmi_health.sh - Supermicro hardware health, run on the server itself. bash only, no jq, no Redfish.
+# smc_ipmi_health.sh - Supermicro and Intel server-board hardware health, run on the server itself.
+#   bash only, no jq, no Redfish. Any board with a standard IPMI BMC gets most of it; Supermicro (X9-X13, H11-H13)
+#   and Intel (S2600 family, M50CYP, D50TNP) sensor naming and quirks are handled explicitly.
 #   BMC via ipmitool over KCS (sensors, PSUs, chassis faults, SEL); inventory via dmidecode/sysfs; memory
 #   errors via EDAC; drives via smartctl, storcli/perccli (MegaRAID), mdadm, zpool; NICs via sysfs;
 #   GPUs via nvidia-smi (+ dmesg Xids, NVLink counters) and amdgpu sysfs.
@@ -31,11 +33,11 @@ flag() { case "$st $1" in *Critical*) st=Critical;; *Warning*) st=Warning;; *ERR
 # --- BMC sensors: $SDR holds "ipmitool sdr elist" as name|id|status|entity|reading lines ---
 ipst() { case $1 in ok) echo OK;; nc|lnc|unc) echo Warning;; cr|nr|lcr|ucr|lnr|unr) echo Critical;; ns|na) echo;; *) echo Warning;; esac; }
 BAD='Failure detected|Fault|Uncorrectable|Thermal Trip|IERR|Non-?[Rr]ecoverable|Transition to Critical|AC lost|input lost|out-of-range|Device Disabled|FRB|Limit Exceeded|Overload|Insufficient|In Critical Array|In Failed Array'
-WARN='Predictive|Correctable|Non-?[Cc]ritical|[Ii]ntrusion|Config Error|Redundancy Lost|Non-?redundant|Degraded|Logging Disabled|Timer expired|Hard Reset|Power Down|Power Cycle|Throttl|Over-?[Tt]emp|Rebuild|Remap'
+WARN='Predictive|Correctable|Non-?[Cc]ritical|[Ii]ntrusion|Config(uration)? Error|Redundancy Lost|Non-?[Rr]edundant|Degraded|Logging Disabled|Timer expired|Hard Reset|Power Down|Power Cycle|Throttl|Over-?[Tt]emp|Rebuild|Remap|Almost Full|Log Full|SEL Full'
 dst()  { if [[ $1 =~ $BAD ]]; then echo Critical; elif [[ $1 =~ $WARN ]]; then echo Warning; else echo OK; fi; }
 thr()  { ipmi sensor get "$1" | awk -F': *' '/^ (Lower|Upper) (Non-Critical|Critical|Non-Recoverable)/ && $2!="na" {
            printf "%s%s%s %g", (c++?" ":""), tolower(substr($1,2,1)), ($1~/Non-C/?"nc":$1~/Non-R/?"nr":"cr"), $2}'; }
-RE_MEM='DIMM|MEM|Memory'; RE_CPU='CPU|Proc'; RE_PSU='^PS[0-9]|Power Supply|PSU|PWR'
+RE_MEM='DIMM|MEM|Mem'; RE_CPU='CPU|Proc|^P[0-9]+ '; RE_PSU='^PS[0-9]|Power Supply|PSU|PWR'     # Intel BMC: "P1 Status", "Mem P1 Thrm Trip"
 RE_DRV='HDD|Drive|SAS|NVMe|SSD|Disk|Slot|M2|M\.2|BPN|Backplane'
 # sensors t UNIT_RE: threshold sensors whose reading matches; sensors d|D NAME_RE: discrete sensors whose name matches|doesn't
 sensors() {
@@ -44,11 +46,13 @@ sensors() {
     [[ $n ]] || continue
     if [[ $1 == t ]]; then
       [[ $r =~ $2 ]] || continue; w=$(ipst "$s"); [[ $w ]] || continue      # ns/na = not installed, like Absent
+      [[ $n =~ Margin|Mrgn ]] && r+=" (thermal margin: negative = headroom)"   # Intel BMC reports CPU/DIMM margin to Tcontrol
       if [[ $w == OK ]]; then echo "  $n $r: OK"; else t=$(thr "$n"); echo "  $n $r${t:+ (thresholds $t)}: $w"; fi
     else
       [[ $r =~ (degrees|RPM|Volts|Watts|Amps|^No Reading$) || $s == ns || $s == na ]] && continue
       if [[ $1 == d ]]; then [[ $n =~ $2 ]] || continue; else [[ $n =~ $2 ]] && continue; fi
-      echo "  $n${r:+ $r}: $(dst "$r")"
+      w=$(dst "$r"); t=$(ipst "$s"); [[ $t == Critical || ( $t == Warning && $w == OK ) ]] && w=$t   # "P1 Therm Ctrl %", "System Airflow" carry status, not text
+      echo "  $n${r:+ $r}: $w"
     fi
   done 3<<<"$SDR"
 }
@@ -103,8 +107,9 @@ drive() {   # drive DEV TYPE: one smartctl line (SATA, SAS, NVMe, drives behind 
   [[ $h == PASSED || $h == OK ]] || flag Critical "health $h"
   w=$(kv 'Percentage Used|Percentage used endurance indicator' "$s"); w=${w%\%}                     # NVMe, SAS
   num "$w" || w=$(awk '$2~/Wearout|Lifetime_Remain|Life_Left|Life_Remaining|Wear_Leveling|Rated_Life_Remain/ && $4~/^[0-9]+$/{print 100-$4; exit}' <<<"$s")
-  if [[ $s == *ATTRIBUTE_NAME* ]]; then      # ATA: reallocated, reported uncorrectable, pending, offline uncorrectable
-    bad=$(awk '($1==5||$1==187||$1==197||$1==198)&&NF>=10{n+=$10} END{print n+0}' <<<"$s"); (( bad )) && flag Warning "bad sectors $bad"
+  if [[ $s == *ATTRIBUTE_NAME* ]]; then      # ATA: 5 reallocated (retired NAND blocks on SSDs), 197 pending, 198/187 uncorrectable
+    bad=$(awk '($1==5||$1==187||$1==197||$1==198)&&NF>=10&&$10+0>0{printf "%s%s %d",(n++?" ":""),($1==5?"reallocated":$1==197?"pending":$1==198?"offline-uncorrectable":"reported-uncorrectable"),$10}' <<<"$s")
+    [[ $bad ]] && flag Warning "$bad"
   fi
   cw=$(kv 'Critical Warning' "$s"); me=$(kv 'Media and Data Integrity Errors' "$s"); me=${me//,/}  # NVMe
   sp=$(kv 'Available Spare' "$s"); sp=${sp%\%}; spt=$(kv 'Available Spare Threshold' "$s"); spt=${spt%\%}
@@ -137,11 +142,13 @@ storage() {
            m=""; for(i=12;i<=NF-2;i++) m=m" "$i; printf "    pd %s %s%s %s %s %s: %s\n",$1,$7,m,$5,$6,s,w}' <<<"$o"
     done
   elif grep -qiE 'MegaRAID|LSI|Broadcom|Avago' <<<"$raid"; then echo "  $raid, storcli not installed: ERROR"
+  elif grep -qiE 'Intel.*(VMD|Volume Management|RAID)' <<<"$raid"; then echo "  $raid: Intel VROC/RSTe, arrays appear as md devices below"
   elif [[ $raid ]]; then echo "  $raid: no supported CLI, RAID state not checked"
   fi
   if [[ -r /proc/mdstat ]] && have mdadm; then
     for m in $(awk '/^md[0-9]+ *:/{print $1}' /proc/mdstat); do
       o=$(run mdadm --detail "/dev/$m"); s=$(kv State "$o")
+      [[ $(kv 'Raid Level' "$o") == container ]] && { echo "  md $m $(kv Version "$o") container, member arrays $(kv 'Member Arrays' "$o")"; continue; }   # VROC/RSTe imsm, DDF
       case $s in *FAILED*|*inactive*) w=Critical;; *degraded*|*recovering*|*resyncing*|*reshaping*) w=Warning;; "") w=ERROR;; *) w=OK;; esac
       echo "  md $m $(kv 'Raid Level' "$o") ${s:-unreadable}: $w"
     done
@@ -154,14 +161,17 @@ storage() {
   sensors d "$RE_DRV"
 }
 
-network() {   # physical NICs that are administratively up
-  local d i f op sp drv
+network() {   # physical NICs that are administratively up; no carrier only matters if the port is meant to carry traffic
+  local d i f op sp drv cfg
   echo "Network:"
   for d in /sys/class/net/*/device; do
     [[ -e $d ]] || continue; i=${d%/device}; i=${i##*/}
     f=$(<"/sys/class/net/$i/flags"); (( f & 1 )) || continue
     op=$(<"/sys/class/net/$i/operstate"); sp=$(cat "/sys/class/net/$i/speed" 2>/dev/null); num "$sp" || sp=?; drv=$(basename "$(readlink "$d/driver" 2>/dev/null)")
-    case $op in up) echo "  $i $drv $sp Mb/s: OK";; unknown) echo "  $i $drv link state unknown: OK";; *) echo "  $i $drv $op, no carrier: Warning";; esac
+    cfg=; [[ -e /sys/class/net/$i/master ]] && cfg="member of $(basename "$(readlink "/sys/class/net/$i/master")")"
+    [[ $cfg ]] || { have ip && cfg=$(ip -o addr show dev "$i" scope global 2>/dev/null | awk '{print "has address "$4; exit}'); }
+    case $op in up) echo "  $i $drv $sp Mb/s: OK";; unknown) echo "  $i $drv link state unknown: OK";;
+      *) if [[ $cfg ]]; then echo "  $i $drv no carrier but $cfg: Warning"; else echo "  $i $drv no carrier, unplugged spare port"; fi;; esac
   done
 }
 
@@ -242,20 +252,24 @@ sel() {
 }
 
 report() {
-  local ch v s
+  local ch v s ip
   ch=$(ipmi chassis status)
-  echo "System: $(dmi sys_vendor) $(dmi product_name) SN $(dmi product_serial), board $(dmi board_name) SN $(dmi board_serial), power $(kv 'System Power' "$ch"), BIOS $(dmi bios_version) ($(dmi bios_date)), BMC $(kv 'Firmware Revision' "$MC") at $(kv 'IP Address' "$(ipmi lan print)")"
+  for s in 1 8 3 2; do ip=$(kv 'IP Address' "$(ipmi lan print $s)"); [[ $ip && $ip != 0.0.0.0 ]] && break; done   # Supermicro ch 1 (8 on some X13), Intel dedicated RMM = ch 3
+  echo "System: $(dmi sys_vendor) $(dmi product_name) SN $(dmi product_serial), board $(dmi board_name) SN $(dmi board_serial), power $(kv 'System Power' "$ch"), BIOS $(dmi bios_version) ($(dmi bios_date)), BMC $(kv 'Manufacturer Name' "$MC") $(kv 'Firmware Revision' "$MC") at ${ip:-?}"
   echo "Chassis:"
   [[ $SDR ]] || echo "  BMC sensor repository (ipmitool sdr elist) is empty or unreadable: ERROR"
   for s in 'Power Overload' 'Main Power Fault' 'Power Control Fault' 'Drive Fault' 'Cooling/Fan Fault'; do
     v=$(kv "$s" "$ch"); [[ $v ]] && echo "  $s $v: $([[ $v == false ]] && echo OK || echo Critical)"; done
   v=$(kv 'Chassis Intrusion' "$ch"); [[ $v ]] && echo "  Chassis Intrusion $v: $([[ $v == inactive ]] && echo OK || echo Warning)"
-  sensors D "$RE_MEM|$RE_CPU|$RE_PSU|$RE_DRV"      # intrusion, watchdog and other misc discrete sensors
+  s=$(sensors D "$RE_MEM|$RE_CPU|$RE_PSU|$RE_DRV")  # intrusion, watchdogs, buttons, presence, redundancy, ... (Intel BMCs have dozens)
+  grep -v ': OK$' <<<"$s" | grep .; v=$(grep -c ': OK$' <<<"$s"); (( v )) && echo "  $v other discrete sensors: OK"
   processors; memory
   echo "Temperatures:"; sensors t degrees
   echo "Fans:"; sensors t RPM
   echo "Voltages:"; sensors t Volts
-  v=$(kv 'Instantaneous power reading' "$(ipmi dcmi power reading)"); echo "Power:${v:+ $v in use}"
+  v=$(kv 'Instantaneous power reading' "$(ipmi dcmi power reading)")
+  [[ $v ]] || v=$(awk -F'|' '$1 ~ /^PS[0-9]+ (Power In|Input Power)$/ && $5 ~ /Watts/ {w+=$5+0} END{if(w) print w" Watts (sum of PSU inputs)"}' <<<"$SDR")   # no DCMI: add up Intel "PSn Power In"
+  echo "Power:${v:+ $v in use}"
   sensors t 'Watts|Amps'; sensors d "$RE_PSU"
   storage; network; gpus; sel
 }
@@ -263,7 +277,7 @@ report() {
 have ipmitool || { echo "UNKNOWN: ipmitool not installed"; exit 3; }
 (( EUID == 0 )) || { echo "UNKNOWN: run as root (ipmitool, dmidecode, smartctl need it)"; exit 3; }
 MC=$(ipmi mc info)
-[[ $MC == *"Firmware Revision"* ]] || { echo "UNKNOWN: ipmitool cannot reach the BMC (modprobe ipmi_si ipmi_devintf, or set IPMITOOL_OPTS)"; exit 3; }
+[[ $MC == *"Firmware Revision"* ]] || { echo "UNKNOWN: ipmitool cannot reach the BMC (modprobe ipmi_si ipmi_devintf, ipmi_ssif on some boards, or set IPMITOOL_OPTS)"; exit 3; }
 SDR=$(ipmi sdr elist | sed 's/ *| */|/g; s/^ *//; s/ *$//')
 DMESG=$(run dmesg)
 out=$(report)
