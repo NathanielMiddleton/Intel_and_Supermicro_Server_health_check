@@ -18,7 +18,7 @@ Supermicro (X9–X13, H11–H13) and Intel (S2600 family, M50CYP, D50TNP) are ha
 | Storage | `storcli64`/`perccli64`, `mdadm --detail`, `zpool`, `smartctl --scan-open`, drive-slot sensors | controller status and cache memory errors, VD/PD states, md degraded/recovering, zpool health, SMART health, NVMe critical warning/spare/media errors, ATA reallocated/pending/uncorrectable sectors (named individually), SAS grown defects, SSD wear |
 | Network | sysfs, `ip addr` | physical NICs that are up with no carrier **and** either carry an address or belong to a bond/bridge; unplugged spare ports are listed without a verdict |
 | GPUs | `lspci`, `nvidia-smi`, dmesg, amdgpu sysfs | GPUs missing from the driver, volatile ECC UE, retired pages / row remap pending or failed, hw/thermal slowdown, PCIe width degradation, NVLink error counters, Xids per GPU (48 63 64 74 79 92 94 95 119 120 are Critical); AMD RAS UE/CE counters |
-| SEL | `ipmitool sel info`, `sel elist` | when the log is ≥ `SEL_CLEAR_AT` % full (default 90) it is archived in full to `SEL_ARCHIVE` and then cleared, so the BMC keeps logging; the last five events are printed for context, not judged |
+| SEL | `ipmitool sel info`, `sel elist` | log ≥ 90 % full is a Warning (the BMC stops recording when full); with `--clearsel` the log is archived in full to `SEL_ARCHIVE` and cleared instead; the last five events are printed for context, not judged |
 
 Each tool is optional except `ipmitool`. A missing tool is reported as `ERROR` only when the hardware it
 covers is present (a MegaRAID card without `storcli`, NVIDIA GPUs without `nvidia-smi`, no `smartctl` at all).
@@ -34,9 +34,11 @@ covers is present (a MegaRAID card without `storcli`, NVIDIA GPUs without `nvidi
 ## Usage
 
 ```
-smc_ipmi_health.sh [-q]
+smc_ipmi_health.sh [-q] [-c|--clearsel]
 
-  -q   only print what is not OK; prints nothing at all when healthy
+  -q              only print what is not OK; prints nothing at all when healthy
+  -c, --clearsel  if the SEL is at least SEL_CLEAR_AT % full, archive it in full and clear it;
+                  without this flag a full SEL is reported as a Warning and never touched
 ```
 
 Environment:
@@ -45,7 +47,7 @@ Environment:
 |---|---|---|
 | `IPMITOOL_OPTS` | empty | extra `ipmitool` arguments, e.g. `-I open`, or `-H bmc -U admin -f pwfile` to query the BMC out of band |
 | `TOOL_TIMEOUT` | `60` | seconds allowed per external command (`ipmitool`, `smartctl`, `storcli`, `nvidia-smi`, …) |
-| `SEL_CLEAR_AT` | `90` | archive and clear the SEL once it is this % full; `0` never clears (a full SEL is then a Warning) |
+| `SEL_CLEAR_AT` | `90` | fill level at which `--clearsel` acts; `0` clears whenever the flag is given |
 | `SEL_ARCHIVE` | `/var/log/ipmi-sel` | where the archived logs go, one `sel-<host>-<timestamp>.log` per clear |
 
 Exit codes follow the Nagios convention: `0` OK, `1` WARNING, `2` CRITICAL, `3` UNKNOWN (not root, BMC
@@ -79,8 +81,10 @@ RESULT: CRITICAL
 With `-q` the output is just `hostname VERDICT` followed by the offending lines, which makes it cron-mail friendly:
 
 ```
-0 * * * * root /usr/local/sbin/smc_ipmi_health.sh -q
+0 * * * * root /usr/local/sbin/smc_ipmi_health.sh -q --clearsel
 ```
+
+Leave `--clearsel` off if the SEL must only ever be cleared by hand; a full SEL then stays a Warning.
 
 As a Nagios/Icinga/check_mk local check, run it without `-q` and let the plugin framework keep the long output.
 
@@ -112,9 +116,9 @@ container (`md127`, always *inactive*) is listed without a verdict and the membe
 - The SEL is shown, not classified: the last five entries are printed for context. Memory ECC events
   therefore surface through EDAC and dmesg, not the SEL.
 - IPMI has no partial truncate, only `sel clear`, and most BMCs (Supermicro's 512-entry SEL included) stop
-  recording once full. The script therefore archives the complete log before clearing, verifies the dump
-  holds as many entries as the BMC reports, refuses to clear otherwise, and notes each clear in syslog
-  (`logger -t smc_ipmi_health`). Set `SEL_CLEAR_AT=0` if the SEL must only be cleared by hand.
+  recording once full. With `--clearsel` the script archives the complete log before clearing, verifies the
+  dump holds as many entries as the BMC reports, refuses to clear otherwise, and notes each clear in syslog
+  (`logger -t smc_ipmi_health`). Without the flag it never writes to the BMC.
 - Broadcom HBAs in IR mode (`sas3ircu`) and Adaptec controllers are not parsed; disks behind them still
   appear through `smartctl` if the driver exposes them.
 - NVIDIA checks that need a newer driver (row remapping, `clocks_event_reasons`) degrade silently on old
