@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # smc_ipmi_health.sh - Supermicro and Intel server-board hardware health, run on the server itself.
-#   bash only, no jq, no Redfish. Any board with a standard IPMI BMC gets most of it; Supermicro (X9-X13, H11-H13)
-#   and Intel (S2600 family, M50CYP, D50TNP) sensor naming and quirks are handled explicitly.
+#   Any board with a standard IPMI BMC gets most of it; Supermicro (X9-X13, H11-H13) and Intel (S2600 family,
+#   M50CYP, D50TNP) sensor naming and quirks are handled explicitly.
 #   BMC via ipmitool over KCS (sensors, PSUs, chassis faults, SEL); inventory via dmidecode/sysfs; memory
 #   errors via EDAC; drives via smartctl, storcli/perccli (MegaRAID), mdadm, zpool; NICs via sysfs;
 #   GPUs via nvidia-smi (+ dmesg Xids, NVLink counters) and amdgpu sysfs.
@@ -21,7 +21,7 @@
 #                      per line or space separated, # comments; a directory whose entry names are sections also
 #                      works; "all" silences everything). Silenced sections still run and print, but their
 #                      Warning/Critical/ERROR lines are tagged [silenced] and ignored by the summary, the -q
-#                      output and the exit code. Living in /tmp, the file disappears on reboot by design.
+#                      output and the exit code. The file is not persistent across reboots.
 # Exit: 0 OK, 1 Warning, 2 Critical, 3 cannot check (BMC unreachable, or smartctl/storcli/nvidia-smi is
 #       needed for installed hardware but missing)
 # Every health line ends in ": OK", ": Warning", ": Critical" or ": ERROR"; summary and verdict are read from that.
@@ -80,7 +80,7 @@ sensors() {
   while IFS='|' read -r -u3 n id s e r; do
     [[ $n ]] || continue
     if [[ $1 == t ]]; then
-      [[ $r =~ $2 ]] || continue; w=$(ipst "$s"); [[ $w ]] || continue      # ns/na = not installed, like Absent
+      [[ $r =~ $2 ]] || continue; w=$(ipst "$s"); [[ $w ]] || continue      # ns/na = sensor not installed
       [[ $n =~ Margin|Mrgn ]] && r+=" (thermal margin: negative = headroom)"   # Intel BMC reports CPU/DIMM margin to Tcontrol
       if [[ $w == OK ]]; then echo "  $n $r: OK"; else t=$(thr "$n"); echo "  $n $r${t:+ (thresholds $t)}: $w"; fi
     else
