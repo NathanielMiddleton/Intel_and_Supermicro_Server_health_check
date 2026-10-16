@@ -260,8 +260,11 @@ report() {
   [[ $SDR ]] || echo "  BMC sensor repository (ipmitool sdr elist) is empty or unreadable: ERROR"
   for s in 'Power Overload' 'Main Power Fault' 'Power Control Fault' 'Drive Fault' 'Cooling/Fan Fault'; do
     v=$(kv "$s" "$ch"); [[ $v ]] && echo "  $s $v: $([[ $v == false ]] && echo OK || echo Critical)"; done
-  v=$(kv 'Chassis Intrusion' "$ch"); [[ $v ]] && echo "  Chassis Intrusion $v: $([[ $v == inactive ]] && echo OK || echo Warning)"
-  s=$(sensors D "$RE_MEM|$RE_CPU|$RE_PSU|$RE_DRV")  # intrusion, watchdogs, buttons, presence, redundancy, ... (Intel BMCs have dozens)
+  v=$(kv 'Chassis Intrusion' "$ch"); [[ $v ]] && { [[ $v == inactive ]] && echo "  Chassis Intrusion inactive: OK" || echo "  Chassis Intrusion $v (latched until cleared in the BMC, not judged)"; }
+  # misc discrete sensors: intrusion, watchdogs, buttons, presence, redundancy ... (Intel BMCs have dozens). Only Critical-class
+  # readings count here; Warning-class ones (latched intrusion, stale watchdog/power events, lost redundancy) are shown but not
+  # scored, since the primary fan/PSU/temperature sensors already cover anything that is actually wrong right now
+  s=$(sensors D "$RE_MEM|$RE_CPU|$RE_PSU|$RE_DRV" | sed 's/: Warning$/ (not judged)/')
   grep -v ': OK$' <<<"$s" | grep .; v=$(grep -c ': OK$' <<<"$s"); (( v )) && echo "  $v other discrete sensors: OK"
   processors; memory
   echo "Temperatures:"; sensors t degrees
