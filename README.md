@@ -34,12 +34,21 @@ covers is present (a MegaRAID card without `storcli`, NVIDIA GPUs without `nvidi
 ## Usage
 
 ```
-smc_ipmi_health.sh [-q] [-c|--clearsel]
+smc_ipmi_health.sh [-q] [-c|--clearsel] [SECTION...]
 
-  -q              only print what is not OK; prints nothing at all when healthy
+  -q, --quiet     only print what is not OK; prints nothing at all when healthy
   -c, --clearsel  if the SEL is at least SEL_CLEAR_AT % full, archive it in full and clear it;
                   without this flag a full SEL is reported as a Warning and never touched
+  SECTION         report only these sections; any number can be combined, default is everything:
+                  --system  --chassis  --cpu  --memory  --temps  --fans  --voltages
+                  --power  --storage  --network  --gpu  --sel
+  -h, --help      usage
 ```
+
+With a section selection the summary, `RESULT` line and exit code cover only what was selected, so
+`smc_ipmi_health.sh -q --storage` is a disk-only check and `--gpu --temps --fans` a thermal one.
+Sections that don't need the BMC (`--network`, `--gpu`) run even on a machine without `ipmitool` or
+`/dev/ipmi0`. Aliases are accepted (`--disks`, `--raid`, `--psu`, `--mem`, `--nics`, `--temp`, …).
 
 Environment:
 
@@ -81,7 +90,8 @@ RESULT: CRITICAL
 With `-q` the output is just `hostname VERDICT` followed by the offending lines, which makes it cron-mail friendly:
 
 ```
-0 * * * * root /usr/local/sbin/smc_ipmi_health.sh -q --clearsel
+0 * * * *   root /usr/local/sbin/smc_ipmi_health.sh -q --clearsel      # everything, hourly
+*/5 * * * * root /usr/local/sbin/smc_ipmi_health.sh -q --gpu --temps   # thermals and GPUs, every 5 min
 ```
 
 Leave `--clearsel` off if the SEL must only ever be cleared by hand; a full SEL then stays a Warning.
