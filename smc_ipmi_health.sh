@@ -5,10 +5,14 @@
 #   BMC via ipmitool over KCS (sensors, PSUs, chassis faults, SEL); inventory via dmidecode/sysfs; memory
 #   errors via EDAC; drives via smartctl, storcli/perccli (MegaRAID), mdadm, zpool; NICs via sysfs;
 #   GPUs via nvidia-smi (+ dmesg Xids, NVLink counters) and amdgpu sysfs.
-# Usage: smc_ipmi_health.sh [-q] [-c|--clearsel]
-#   -q              only print what is not OK (silent when healthy)
+# Usage: smc_ipmi_health.sh [-q] [-c|--clearsel] [SECTION...]
+#   -q, --quiet     only print what is not OK (silent when healthy)
 #   -c, --clearsel  if the SEL is at least SEL_CLEAR_AT % full, archive it in full to SEL_ARCHIVE and clear it;
 #                   without this flag a full SEL is only reported (Warning), never touched
+#   SECTION         report only these sections (any number, default all): --system --chassis --cpu --memory
+#                   --temps --fans --voltages --power --storage --network --gpu --sel
+#                   The summary, verdict and exit code then cover only the selected sections. Sections that
+#                   do not need the BMC (--network, --gpu) run even where ipmitool or /dev/ipmi0 is missing.
 # Env:  IPMITOOL_OPTS  extra ipmitool args; default is the local KCS interface (modprobe ipmi_si ipmi_devintf)
 #       TOOL_TIMEOUT   seconds per external command, default 60
 #       SEL_CLEAR_AT   fill level (%) at which --clearsel acts, default 90 (0 = always clear when --clearsel is given)
@@ -19,11 +23,21 @@
 set -u
 export LC_ALL=C
 
-q=0; clearsel=0; args=()
-for a in "$@"; do case $a in --clearsel|--clear-sel) clearsel=1;; --quiet) args+=(-q);; *) args+=("$a");; esac; done   # long forms
+usage() { sed -n '/^# Usage:/,/^# Env:/{/^# Env:/!s/^# \{0,1\}//p}' "$0"; }
+sect() { case $1 in system|sys) echo system;; chassis) echo chassis;; processors|cpu|cpus|proc|procs) echo processors;;
+         memory|mem|dimms|ram) echo memory;; temperatures|temps|temp|thermal) echo temperatures;; fans|fan) echo fans;;
+         voltages|volts|voltage) echo voltages;; power|psu|psus) echo power;; storage|disks|disk|drives|raid) echo storage;;
+         network|net|nics|nic) echo network;; gpus|gpu) echo gpus;; sel|log) echo sel;; esac; }
+want() { [[ -z $only || " $only " == *" $1 "* ]]; }      # section selected (no selection = everything)
+q=0; clearsel=0; only=; args=()
+for a in "$@"; do case $a in
+  --clearsel|--clear-sel) clearsel=1;; --quiet) args+=(-q);; -h|--help) usage; exit 0;;
+  --*) x=$(sect "${a#--}"); [[ $x ]] || { echo "unknown option $a" >&2; usage >&2; exit 3; }; only+=" $x";;
+  *) args+=("$a");; esac; done
 set -- ${args[@]+"${args[@]}"}
 : "${SEL_CLEAR_AT:=90}" "${SEL_ARCHIVE:=/var/log/ipmi-sel}"; [[ $SEL_CLEAR_AT =~ ^[0-9]+$ ]] || SEL_CLEAR_AT=90
-while getopts ":qc" o; do case $o in q) q=1;; c) clearsel=1;; *) echo "usage: $0 [-q] [-c|--clearsel]" >&2; exit 3;; esac; done
+while getopts ":qch" o; do case $o in q) q=1;; c) clearsel=1;; h) usage; exit 0;; *) usage >&2; exit 3;; esac; done
+needbmc=0; for x in system chassis processors memory temperatures fans voltages power storage sel; do want $x && needbmc=1; done
 
 have() { command -v "$1" >/dev/null 2>&1; }
 run()  { timeout "${TOOL_TIMEOUT:-60}" "$@" 2>/dev/null </dev/null; }      # external tool, stderr dropped
@@ -269,11 +283,16 @@ sel() {
   grep '|' <<<"$last" | sed 's/ *| */ | /g; s/^ */  /'
 }
 
-report() {
-  local ch v s ip
+system() {
+  local ch s ip
   ch=$(ipmi chassis status)
   for s in 1 8 3 2; do ip=$(kv 'IP Address' "$(ipmi lan print $s)"); [[ $ip && $ip != 0.0.0.0 ]] && break; done   # Supermicro ch 1 (8 on some X13), Intel dedicated RMM = ch 3
   echo "System: $(dmi sys_vendor) $(dmi product_name) SN $(dmi product_serial), board $(dmi board_name) SN $(dmi board_serial), power $(kv 'System Power' "$ch"), BIOS $(dmi bios_version) ($(dmi bios_date)), BMC $(kv 'Manufacturer Name' "$MC") $(kv 'Firmware Revision' "$MC") at ${ip:-?}"
+}
+
+chassis() {
+  local ch v s
+  ch=$(ipmi chassis status)
   echo "Chassis:"
   [[ $SDR ]] || echo "  BMC sensor repository (ipmitool sdr elist) is empty or unreadable: ERROR"
   for s in 'Power Overload' 'Main Power Fault' 'Power Control Fault' 'Drive Fault' 'Cooling/Fan Fault'; do
@@ -284,23 +303,41 @@ report() {
   # scored, since the primary fan/PSU/temperature sensors already cover anything that is actually wrong right now
   s=$(sensors D "$RE_MEM|$RE_CPU|$RE_PSU|$RE_DRV" | sed 's/: Warning$/ (not judged)/')
   grep -v ': OK$' <<<"$s" | grep .; v=$(grep -c ': OK$' <<<"$s"); (( v )) && echo "  $v other discrete sensors: OK"
-  processors; memory
-  echo "Temperatures:"; sensors t degrees
-  echo "Fans:"; sensors t RPM
-  echo "Voltages:"; sensors t Volts
+}
+
+power() {
+  local v
   v=$(kv 'Instantaneous power reading' "$(ipmi dcmi power reading)")
   [[ $v ]] || v=$(awk -F'|' '$1 ~ /^PS[0-9]+ (Power In|Input Power)$/ && $5 ~ /Watts/ {w+=$5+0} END{if(w) print w" Watts (sum of PSU inputs)"}' <<<"$SDR")   # no DCMI: add up Intel "PSn Power In"
   echo "Power:${v:+ $v in use}"
   sensors t 'Watts|Amps'; sensors d "$RE_PSU"
-  storage; network; gpus; sel
 }
 
-have ipmitool || { echo "UNKNOWN: ipmitool not installed"; exit 3; }
+report() {   # every section is its own function; a selection on the command line (--storage ...) picks which ones run
+  want system       && system
+  want chassis      && chassis
+  want processors   && processors
+  want memory       && memory
+  want temperatures && { echo "Temperatures:"; sensors t degrees; }
+  want fans         && { echo "Fans:"; sensors t RPM; }
+  want voltages     && { echo "Voltages:"; sensors t Volts; }
+  want power        && power
+  want storage      && storage
+  want network      && network
+  want gpus         && gpus
+  want sel          && sel
+  return 0
+}
+
 (( EUID == 0 )) || { echo "UNKNOWN: run as root (ipmitool, dmidecode, smartctl need it)"; exit 3; }
-MC=$(ipmi mc info)
-[[ $MC == *"Firmware Revision"* ]] || { echo "UNKNOWN: ipmitool cannot reach the BMC (modprobe ipmi_si ipmi_devintf, ipmi_ssif on some boards, or set IPMITOOL_OPTS)"; exit 3; }
-SDR=$(ipmi sdr elist | sed 's/ *| */|/g; s/^ *//; s/ *$//')
-DMESG=$(run dmesg)
+MC=; SDR=; DMESG=
+if (( needbmc )); then
+  have ipmitool || { echo "UNKNOWN: ipmitool not installed"; exit 3; }
+  MC=$(ipmi mc info)
+  [[ $MC == *"Firmware Revision"* ]] || { echo "UNKNOWN: ipmitool cannot reach the BMC (modprobe ipmi_si ipmi_devintf, ipmi_ssif on some boards, or set IPMITOOL_OPTS)"; exit 3; }
+  SDR=$(ipmi sdr elist | sed 's/ *| */|/g; s/^ *//; s/ *$//')
+fi
+{ want processors || want gpus; } && DMESG=$(run dmesg)
 out=$(report)
 
 # verdict from the text: Critical > Warning > ERROR > OK
@@ -311,11 +348,11 @@ else rc=0; v=OK; fi
 
 if (( q )); then (( rc )) && { echo "$(hostname -s) $v"; grep -E ': (Critical|Warning|ERROR)$' <<<"$out"; }
 else
-  head -1 <<<"$out"
+  [[ $out == System:* ]] && { head -1 <<<"$out"; out=$(tail -n +2 <<<"$out"); }
   awk '/^[^ ]/{sec=tolower($1); sub(/:.*/,"",sec); next}          # worst status per section
        /: (OK|Warning|Critical|ERROR)$/{r=($NF=="Critical")?3:($NF=="Warning")?2:($NF=="ERROR")?1:0
          if(!(sec in w)){o[++n]=sec; w[sec]=0} if(r>w[sec]) w[sec]=r}
        END{split("OK ERROR Warning Critical",t," "); printf "Summary:"; for(i=1;i<=n;i++) printf "%s %s %s",(i>1?",":""),o[i],t[w[o[i]]+1]; print ""}' <<<"$out"
-  tail -n +2 <<<"$out"; echo "RESULT: $v"
+  [[ $out ]] && echo "$out"; echo "RESULT: $v"
 fi
 exit $rc
